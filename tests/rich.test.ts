@@ -6,9 +6,9 @@ import { test } from "node:test";
 import type { NotificationContent } from "../src/format.ts";
 import { formatRichMessage, RICH_MESSAGE_LIMIT } from "../src/rich.ts";
 
-const header = "Message from host:\\\n**Pi completed**\\\nSession: s\\\nDirectory: /work\n\n";
+const header = "**Pi completed**\\\nSession: s\\\nDirectory: /work\n\n";
 const content = (detail: string, cwd = "/work"): NotificationContent =>
-  ({ host: "host", status: "completed", session: "s", cwd, detail, markdown: true });
+  ({ status: "completed", session: "s", cwd, detail, markdown: true });
 const png = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
   "base64",
@@ -147,7 +147,6 @@ test("images are uploaded or linked, each on its own line, with a text version",
 
 test("header fields and error text are escaped, and long replies end at a block boundary", async () => {
   const error = await formatRichMessage({
-    host: "box_1",
     status: "error",
     session: "a*b",
     cwd: "/tmp/my_dir",
@@ -155,7 +154,6 @@ test("header fields and error text are escaped, and long replies end at a block 
     markdown: false,
   });
   assert.equal(error.markdown, [
-    "Message from box\\_1:\\",
     "**Pi error**\\",
     "Session: a\\*b\\",
     "Directory: /tmp/my\\_dir",

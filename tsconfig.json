@@ -8,7 +8,8 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": ["node"],
+    "erasableSyntaxOnly": true
   },
-  "include": ["index.ts", "src/**/*.ts", "tests/**/*.ts"]
+  "include": ["index.ts", "daemon.ts", "src/**/*.ts", "tests/**/*.ts"]
 }

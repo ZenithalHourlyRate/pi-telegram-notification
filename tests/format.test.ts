@@ -64,7 +64,6 @@ test("long replies are cut to fit one Telegram message", () => {
   // Every row is padded to the long cell, so the table is longer than its source.
   const reply = `| Column | Other |\n| --- | --- |\n| ${"x".repeat(100)} | y |\n${"| a | b |\n".repeat(600)}`;
   const { text, html } = formatNotification({
-    host: "host",
     status: "completed",
     session: "session",
     cwd: "/work",

@@ -36,7 +36,6 @@ export interface RichMessage {
 export async function formatRichMessage(content: NotificationContent): Promise<RichMessage> {
   // A backslash at the end of a line is a line break.
   const header = [
-    `Message from ${escapeMarkdown(content.host)}:`,
     `**Pi ${escapeMarkdown(content.status)}**`,
     `Session: ${escapeMarkdown(content.session)}`,
     `Directory: ${escapeMarkdown(content.cwd)}`,

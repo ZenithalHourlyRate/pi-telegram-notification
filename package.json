@@ -1,19 +1,20 @@
 {
   "name": "pi-telegram-notification",
   "version": "0.1.0",
-  "description": "Opt-in Telegram notifications when Pi finishes working.",
+  "description": "Telegram notifications from Pi, and remote control of Pi sessions from Telegram.",
   "type": "module",
-  "keywords": ["pi-package", "pi-extension", "telegram", "notifications"],
+  "keywords": ["pi-package", "pi-extension", "telegram", "notifications", "remote-control"],
   "engines": {
     "node": ">=22.19.0"
   },
   "pi": {
     "extensions": ["./index.ts"]
   },
-  "files": ["index.ts", "src", "README.md"],
+  "files": ["index.ts", "daemon.ts", "src", "systemd", "README.md"],
   "scripts": {
     "test": "node --experimental-strip-types --test tests/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "daemon": "node daemon.ts"
   },
   "dependencies": {
     "marked": "^18.0.11"

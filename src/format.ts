@@ -5,7 +5,6 @@ import { Lexer, type MarkedToken, type Token, type Tokens } from "marked";
 export const MESSAGE_LIMIT = 4000;
 
 export interface NotificationContent {
-  host: string;
   status: string;
   session: string;
   cwd: string;
@@ -24,13 +23,12 @@ export interface Notification {
 
 export function formatNotification(content: NotificationContent): Notification {
   const header = [
-    `Message from ${content.host}:`,
     `Pi ${content.status}`,
     `Session: ${content.session}`,
     `Directory: ${content.cwd}`,
   ];
-  const [from, title, ...rest] = header.map(escapeHtml);
-  const htmlHeader = [from, `<b>${title}</b>`, ...rest].join("\n");
+  const [title, ...rest] = header.map(escapeHtml);
+  const htmlHeader = [`<b>${title}</b>`, ...rest].join("\n");
   const textHeader = header.join("\n");
   if (!content.detail) return { text: textHeader, html: htmlHeader };
 

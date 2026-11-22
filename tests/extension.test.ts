@@ -47,10 +47,18 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-test-"));
   const config = join(dir, "telegram-notification.json");
   const oldDir = process.env.PI_CODING_AGENT_DIR;
+  const oldSocket = process.env.PI_TELEGRAM_SOCKET;
+  const oldPane = process.env.WEZTERM_PANE;
   process.env.PI_CODING_AGENT_DIR = dir;
+  // Never reach a remote-control daemon running on this computer, or type into a real pane.
+  process.env.PI_TELEGRAM_SOCKET = join(dir, "no-daemon.sock");
+  delete process.env.WEZTERM_PANE;
   t.after(async () => {
     if (oldDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = oldDir;
+    if (oldSocket === undefined) delete process.env.PI_TELEGRAM_SOCKET;
+    else process.env.PI_TELEGRAM_SOCKET = oldSocket;
+    if (oldPane !== undefined) process.env.WEZTERM_PANE = oldPane;
     await rm(dir, { recursive: true, force: true });
   });
   await writeFile(config, JSON.stringify(credentials));
@@ -351,9 +359,9 @@ test("if Telegram rejects the rich message, HTML is sent, and plain text if it r
     [["sendRichMessage", undefined], ["sendMessage", "HTML"], ["sendMessage", undefined]],
   );
   assert.match(f.deliveries[0].text, /\n\nThe task is \*\*complete\*\* & &lt;verified>\.$/);
-  assert.match(f.deliveries[1].text, /\n<b>Pi completed<\/b>\n/);
+  assert.match(f.deliveries[1].text, /^<b>Pi completed<\/b>\n/);
   assert.match(f.deliveries[1].text, /\n\nThe task is <b>complete<\/b> &amp; &lt;verified&gt;\.$/);
-  assert.match(f.deliveries[2].text, /\nPi completed\n/);
+  assert.match(f.deliveries[2].text, /^Pi completed\n/);
   assert.match(f.deliveries[2].text, /\n\nThe task is \*\*complete\*\* & <verified>\.$/);
   const entry = f.receipts()[0];
   assert.ok(entry?.type === "custom");
