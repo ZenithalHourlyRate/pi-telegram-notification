@@ -6,6 +6,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { callTelegram, downloadTelegramFile, TelegramError } from "../api.ts";
 import type { RemoteSettings, TelegramConfig } from "../config.ts";
 import { LinkIndex, type MessageLink } from "../remote/links.ts";
+import { clip } from "../remote/prompt.ts";
 import type { ModelChoice } from "../remote/protocol.ts";
 import { watchScreenLock } from "./away.ts";
 import { findSessionFile, isDirectory, matchDirectory, readSessionHeader, recentDirectories, tildify } from "./dirs.ts";
@@ -752,7 +753,7 @@ function modelQuestion(name: string, models: ModelChoice[], page: number): strin
 function modelKeyboard(key: string, models: ModelChoice[], page: number): TgButton[][] {
   const start = page * MODEL_PAGE_SIZE;
   const rows = models.slice(start, start + MODEL_PAGE_SIZE).map((model, index) => [
-    button(`${model.current ? "✓ " : ""}${clip(`${model.name} (${model.provider})`)}`, `m:${key}:${start + index}`),
+    button(`${model.current ? "✓ " : ""}${clip(`${model.name} (${model.provider})`, 60)}`, `m:${key}:${start + index}`),
   ]);
   const pages = Math.ceil(models.length / MODEL_PAGE_SIZE);
   if (pages > 1) {
@@ -763,11 +764,6 @@ function modelKeyboard(key: string, models: ModelChoice[], page: number): TgButt
     rows.push(arrows);
   }
   return rows;
-}
-
-/** Telegram cuts button text at 64 characters. */
-function clip(text: string): string {
-  return text.length > 60 ? `${text.slice(0, 59)}…` : text;
 }
 
 function linkTo(message: number, live: LiveSession): MessageLink {

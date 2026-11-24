@@ -8,5 +8,14 @@ export function promptLine(content: string | Array<{ type: string; text?: string
     : content.flatMap((part) => (part.type === "text" && part.text ? [part.text] : [])).join(" ");
   const line = text.replace(/\s+/g, " ").trim();
   if (!line) return undefined;
-  return line.length > FIRST_PROMPT_CHARS ? `${line.slice(0, FIRST_PROMPT_CHARS - 1)}…` : line;
+  return clip(line, FIRST_PROMPT_CHARS);
+}
+
+/**
+ * Cut text to max characters and mark the cut with an ellipsis. Counts Unicode code
+ * points, so a cut never leaves half an emoji's surrogate pair.
+ */
+export function clip(text: string, max: number): string {
+  const chars = Array.from(text);
+  return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : text;
 }
