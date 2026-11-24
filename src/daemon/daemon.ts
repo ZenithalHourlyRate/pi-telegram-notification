@@ -6,6 +6,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { callTelegram, downloadTelegramFile, TelegramError } from "../api.ts";
 import type { RemoteSettings, TelegramConfig } from "../config.ts";
 import { LinkIndex, type MessageLink } from "../remote/links.ts";
+import type { ModelChoice } from "../remote/protocol.ts";
 import { watchScreenLock } from "./away.ts";
 import { findSessionFile, isDirectory, matchDirectory, readSessionHeader, recentDirectories, tildify } from "./dirs.ts";
 import { attachmentsOf, composePrompt, saveAttachments } from "./files.ts";
@@ -21,6 +22,8 @@ const PENDING_MS = 60 * 60 * 1000;
 /** How long a Pi opened in WezTerm may take to connect. */
 const CONNECT_TIMEOUT_MS = 45_000;
 const MAX_CHOICES = 8;
+/** Models per page of the /model choice. */
+const MODEL_PAGE_SIZE = 8;
 
 export interface DaemonOptions {
   telegram: TelegramConfig;
@@ -38,6 +41,7 @@ export interface DaemonOptions {
 type Pending =
   | { kind: "route"; message: number; prompt: string; sessions: string[]; created: number }
   | { kind: "new"; message: number; prompt: string; dirs: string[]; created: number }
+  | { kind: "model"; session: string; name: string; models: ModelChoice[]; page: number; created: number }
   | { kind: "stale"; message: TgMessage; created: number };
 
 type SendOptions = {
@@ -249,9 +253,10 @@ export class Daemon {
       await this.say(id, "I don't know which Pi session that message belongs to. Reply to a notification or to an entry of /ls.");
       return;
     }
-    if (command && name === "new") return this.newSession(message, command.args, link);
+    if (name === "new" && command) return this.newSession(message, command.args, link);
     if (name === "stop") return this.stopCommand(id, link);
     if (name === "reload") return this.reloadCommand(id, link);
+    if (name === "model" && command && !command.args) return this.modelCommand(id, link);
     if (command) {
       if (!link) {
         await this.say(id, `To run /${command.name} in a session, send it as a reply to a message from that session. /help lists this bot's commands.`);
@@ -277,6 +282,7 @@ export class Daemon {
       "A command sent as a reply, such as /model or /notify on, runs in that session as if typed on the computer.",
       "",
       "/ls – running sessions, with buttons for the last answer, stopping, and notifications",
+      "/model – choose the session's model with buttons",
       "/new [directory] [prompt] – start a session. The directory can be the start of a project's name. As a reply, it starts in that session's directory.",
       "/stop – stop the session you reply to, or the only one working",
       "/reload – reload the session you reply to, or every session. A working session reloads when it stops.",
@@ -471,6 +477,35 @@ export class Daemon {
     await this.say(messageId, lines.join("\n"));
   }
 
+  /** Show the session's models as buttons, so a Telegram user can pick one instead of typing a name. */
+  private async modelCommand(messageId: number, link: MessageLink | undefined): Promise<void> {
+    if (!link) {
+      await this.say(messageId, "Reply to a message from a session to choose its model.");
+      return;
+    }
+    const live = this.hub.find(link.session);
+    if (!live) {
+      await this.say(messageId, "That session is not running.");
+      return;
+    }
+    // Older extension versions do not know this request, so do not wait the usual time.
+    const result = await this.hub.request(live, { type: "models" }, 5_000);
+    const models = result.models ?? [];
+    if (!models.length) {
+      const message = result.message === "Pi did not answer."
+        ? "Pi did not answer. Reload the session (reply /reload) to use model selection, then send /model again."
+        : result.message ?? "This Pi session reported no models.";
+      await this.say(messageId, message, { session: live });
+      return;
+    }
+    const name = label(live);
+    const key = this.remember({ kind: "model", session: live.session.id, name, models, page: 0, created: Date.now() });
+    await this.say(messageId, modelQuestion(name, models, 0), {
+      keyboard: modelKeyboard(key, models, 0),
+      session: live,
+    });
+  }
+
   private async stopCommand(messageId: number, link: MessageLink | undefined): Promise<void> {
     if (link) {
       const live = this.hub.find(link.session);
@@ -535,6 +570,32 @@ export class Daemon {
       await this.answer(query.id);
       if (where !== undefined) await this.edit(where, action === "y" ? "Sent to Pi." : "Discarded.");
       if (action === "y") await this.onMessage(pending.message, true);
+    } else if (action === "m" && pending.kind === "model") {
+      const model = pending.models[Number(index)];
+      if (!model) return this.answer(query.id);
+      this.pending.delete(key);
+      const live = this.hub.find(pending.session);
+      if (!live) {
+        await this.answer(query.id, "That session has closed.");
+        if (where !== undefined) await this.edit(where, "That session has closed.", { keyboard: [] });
+        return;
+      }
+      const result = await this.hub.request(live, { type: "model", provider: model.provider, modelId: model.id });
+      const done = result.message ?? (result.ok ? `Model: ${model.provider}/${model.id}.` : "Pi did not change the model.");
+      await this.answer(query.id, done);
+      if (where !== undefined) await this.edit(where, done, { keyboard: [] });
+    } else if ((action === "<" || action === ">") && pending.kind === "model") {
+      const page = Number(index);
+      if (!Number.isInteger(page) || page < 0 || page * MODEL_PAGE_SIZE >= pending.models.length) {
+        return this.answer(query.id);
+      }
+      pending.page = page;
+      await this.answer(query.id);
+      if (where !== undefined) {
+        await this.edit(where, modelQuestion(pending.name, pending.models, page), {
+          keyboard: modelKeyboard(key, pending.models, page),
+        });
+      }
     } else {
       await this.answer(query.id);
     }
@@ -675,6 +736,38 @@ function parseCommand(text: string): { name: string; args: string } | undefined 
 
 function button(text: string, data: string): TgButton {
   return { text, callback_data: data };
+}
+
+function modelQuestion(name: string, models: ModelChoice[], page: number): string {
+  const current = models.find((model) => model.current);
+  const pages = Math.ceil(models.length / MODEL_PAGE_SIZE);
+  return [
+    `Choose a model for ${name}.`,
+    ...(current ? [`Current: ${current.provider}/${current.id}.`] : []),
+    ...(pages > 1 ? [`Page ${page + 1} of ${pages}.`] : []),
+  ].join("\n");
+}
+
+/** One model per row, with a current mark and page arrows when the list is long. */
+function modelKeyboard(key: string, models: ModelChoice[], page: number): TgButton[][] {
+  const start = page * MODEL_PAGE_SIZE;
+  const rows = models.slice(start, start + MODEL_PAGE_SIZE).map((model, index) => [
+    button(`${model.current ? "✓ " : ""}${clip(`${model.name} (${model.provider})`)}`, `m:${key}:${start + index}`),
+  ]);
+  const pages = Math.ceil(models.length / MODEL_PAGE_SIZE);
+  if (pages > 1) {
+    const arrows: TgButton[] = [];
+    if (page > 0) arrows.push(button("←", `<:${key}:${page - 1}`));
+    arrows.push(button(`${page + 1}/${pages}`, `?:${key}:${page}`));
+    if (page < pages - 1) arrows.push(button("→", `>:${key}:${page + 1}`));
+    rows.push(arrows);
+  }
+  return rows;
+}
+
+/** Telegram cuts button text at 64 characters. */
+function clip(text: string): string {
+  return text.length > 60 ? `${text.slice(0, 59)}…` : text;
 }
 
 function linkTo(message: number, live: LiveSession): MessageLink {

@@ -21,6 +21,7 @@ import {
   socketPath,
   type DaemonMessage,
   type Hello,
+  type ModelChoice,
   type Request,
   type SessionInfo,
   type SessionState,
@@ -312,8 +313,33 @@ export default function (pi: ExtensionAPI) {
     expected = undefined;
   }
 
-  function answer(id: string, ok: boolean, message?: string): void {
-    remote?.send({ type: "result", id, ok, ...(message ? { message } : {}) });
+  function answer(id: string, ok: boolean, message?: string, models?: ModelChoice[]): void {
+    remote?.send({
+      type: "result",
+      id,
+      ok,
+      ...(message ? { message } : {}),
+      ...(models ? { models } : {}),
+    });
+  }
+
+  /** Models the session can use, the same set Pi's /model picker offers. */
+  function modelChoices(ctx: ExtensionContext): ModelChoice[] {
+    const scoped = ctx.scopedModels.map((entry) => entry.model);
+    const seen = new Set<string>();
+    const choices: ModelChoice[] = [];
+    for (const model of scoped.length ? scoped : ctx.modelRegistry.getAvailable()) {
+      const key = `${model.provider}\0${model.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      choices.push({
+        provider: model.provider,
+        id: model.id,
+        name: model.name,
+        ...(ctx.model?.provider === model.provider && ctx.model.id === model.id ? { current: true } : {}),
+      });
+    }
+    return choices;
   }
 
   function modelLabel(ctx: ExtensionContext): string {
@@ -441,6 +467,25 @@ export default function (pi: ExtensionAPI) {
         if (found.source !== "extension") expectRun(ctx, request.replyTo);
         pi.sendUserMessage(request.text, { expandPromptTemplates: true });
         answer(request.id, true);
+        return;
+      }
+
+      case "models": {
+        const models = modelChoices(ctx);
+        answer(request.id, models.length > 0, models.length ? undefined : "No model has credentials configured.", models);
+        return;
+      }
+
+      case "model": {
+        const model = ctx.modelRegistry.find(request.provider, request.modelId);
+        if (!model) {
+          answer(request.id, false, "That model is not available.");
+          return;
+        }
+        const ok = await pi.setModel(model);
+        answer(request.id, ok, ok
+          ? `Model: ${modelLabel(ctx)}.`
+          : `${model.provider}/${model.id} has no credentials configured.`);
         return;
       }
 
