@@ -33,6 +33,8 @@ export interface SessionInfo {
   file?: string;
   name?: string;
   cwd: string;
+  /** The first prompt, shortened, so sessions in the same directory can be told apart. */
+  firstPrompt?: string;
 }
 
 export interface Hello {

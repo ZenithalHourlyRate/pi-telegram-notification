@@ -14,6 +14,7 @@ import { installNotificationFooter } from "./src/footer.ts";
 import { formatNotification, type NotificationContent } from "./src/format.ts";
 import { RemoteClient } from "./src/remote/client.ts";
 import { appendLinks, type MessageLink } from "./src/remote/links.ts";
+import { promptLine } from "./src/remote/prompt.ts";
 import {
   linksPath,
   PROTOCOL_VERSION,
@@ -106,7 +107,19 @@ export default function (pi: ExtensionAPI) {
       file: ctx.sessionManager.getSessionFile(),
       name: ctx.sessionManager.getSessionName(),
       cwd: ctx.cwd,
+      firstPrompt: firstPrompt(ctx),
     };
+  }
+
+  /**
+   * The session's first user message, on one line and shortened. The daemon shows it in /ls,
+   * where sessions of the same directory would otherwise have the same name.
+   */
+  function firstPrompt(ctx: ExtensionContext): string | undefined {
+    const entry = ctx.sessionManager.getEntries()
+      .find((item) => item.type === "message" && item.message.role === "user");
+    if (!entry || entry.type !== "message" || entry.message.role !== "user") return undefined;
+    return promptLine(entry.message.content);
   }
 
   function notificationContent(
@@ -235,7 +248,8 @@ export default function (pi: ExtensionAPI) {
   function setState(next: SessionState): void {
     if (state === next) return;
     state = next;
-    remote?.send({ type: "update", state });
+    // Include the session, so the first prompt reaches the daemon once Pi starts on it.
+    remote?.send({ type: "update", state, session: current ? sessionInfo(current) : undefined });
   }
 
   function hello(ctx: ExtensionContext): Hello {

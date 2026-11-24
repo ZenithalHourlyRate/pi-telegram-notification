@@ -431,13 +431,21 @@ test("a message that is not a reply asks for a session, and a button sends it", 
 test("/ls lists sessions, and its buttons turn notifications on and send the last answer", async (t) => {
   const f = await fixture(t);
   await f.session.prompt("Earlier task.");
+  // The daemon learns the first prompt when Pi reports that the run settled.
+  await waitFor(() => f.live().session.firstPrompt === "Earlier task.");
   f.telegram.send({ text: "/ls" });
   const entry = await waitFor(() => f.telegram.sent("sendMessage")[0]);
   assert.equal(entry.body.parse_mode, "HTML");
-  assert.match(entry.body.text, /^💤 <b>.+<\/b>\n<code>.+<\/code>\nIdle · notifications off$/);
+  assert.match(entry.body.text, /^💤 <b>.+<\/b>\n<code>.+<\/code>\n<i>“Earlier task\.”<\/i>\nIdle · notifications off$/);
   const data = (entry.body.reply_markup.inline_keyboard.flat() as Array<{ text: string; callback_data: string }>)
     .map((item) => [item.text, item.callback_data.split(":")[0]]);
   assert.deepEqual(data, [["Last answer", "l"], ["Notify on", "o"]]);
+
+  // A session that connected before the extension learned about first prompts still shows one.
+  f.live().session.firstPrompt = undefined;
+  f.telegram.send({ text: "/ls" });
+  const reread = await waitFor(() => f.telegram.sent("sendMessage")[1]);
+  assert.match(reread.body.text, /<i>“Earlier task\.”<\/i>/);
 
   const id = f.live().session.id;
   f.telegram.press(`o:${id}`, entry.id!);

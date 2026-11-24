@@ -10,6 +10,7 @@ import { watchScreenLock } from "./away.ts";
 import { findSessionFile, isDirectory, matchDirectory, readSessionHeader, recentDirectories, tildify } from "./dirs.ts";
 import { attachmentsOf, composePrompt, saveAttachments } from "./files.ts";
 import { SessionHub, type LiveSession } from "./hub.ts";
+import { readFirstPrompt } from "./session-prompt.ts";
 import { spawnPi, type SpawnCommands } from "./spawn.ts";
 import type { TgButton, TgCallbackQuery, TgChat, TgMessage, TgUpdate } from "./types.ts";
 
@@ -290,6 +291,7 @@ export class Daemon {
       await this.say(undefined, "No Pi session is running. Send /new to start one.");
       return;
     }
+    await this.readFirstPrompts(sessions);
     for (const live of sessions) {
       const sent = await this.say(undefined, describe(live), { html: true, keyboard: sessionKeyboard(live), session: live });
       if (sent !== undefined) this.entries.add(sent);
@@ -299,6 +301,19 @@ export class Daemon {
       if (this.entries.size <= 500) break;
       this.entries.delete(old);
     }
+  }
+
+  /**
+   * Sessions that connected before this daemon version was loaded send no first prompt.
+   * Read theirs from the session file, so /ls shows it without reloading the session.
+   */
+  private async readFirstPrompts(sessions: LiveSession[]): Promise<void> {
+    await Promise.all(sessions.map(async (live) => {
+      if (live.session.firstPrompt) return;
+      const file = live.session.file ?? await findSessionFile(this.options.sessionsDir, live.session.id);
+      const firstPrompt = file ? await readFirstPrompt(file) : undefined;
+      if (firstPrompt) live.session = { ...live.session, firstPrompt };
+    }));
   }
 
   /** Save the attachments and build the prompt. Empty when the message has nothing for Pi. */
@@ -682,11 +697,13 @@ function describe(live: LiveSession): string {
   const state = live.state === "working"
     ? "Working"
     : live.state === "waiting" ? "Waiting for an answer on the computer" : "Idle";
-  return [
+  const lines = [
     `${stateIcon(live)} <b>${escapeHtml(label(live))}</b>`,
     `<code>${escapeHtml(tildify(live.session.cwd))}</code>`,
-    `${state} · notifications ${live.notify ? "on" : "off"}`,
-  ].join("\n");
+  ];
+  if (live.session.firstPrompt) lines.push(`<i>“${escapeHtml(live.session.firstPrompt)}”</i>`);
+  lines.push(`${state} · notifications ${live.notify ? "on" : "off"}`);
+  return lines.join("\n");
 }
 
 function sessionKeyboard(live: LiveSession): TgButton[][] {

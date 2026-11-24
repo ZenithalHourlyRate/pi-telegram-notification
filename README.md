@@ -106,7 +106,7 @@ If Pi does not start working on a prompt within 10 seconds, for example because 
 
 ### Bot commands
 
-- `/ls` lists running sessions, one message each, with the name, directory, state, and notification setting. Its buttons send the last answer, stop the run, and turn notifications on or off.
+- `/ls` lists running sessions, one message each, with the name, directory, first prompt, state, and notification setting. Its buttons send the last answer, stop the run, and turn notifications on or off.
 - `/new [directory] [prompt]` starts Pi in a new WezTerm tab. The directory is a path, or the start of a directory name from past sessions, as in `/new robo fix the loader`. Without one match, buttons offer the matching or recent directories. As a reply, it uses that session's directory. Attachments go with the prompt.
 - `/stop` stops the session you reply to. Without a reply, it stops the only working session, or asks which one.
 - `/reload` reloads the session you reply to, or every running session without a reply, for example after updating an extension. A working session reloads when it stops. Only a command handler can reload Pi, so the extension adds `/telegram-reload` for this.
