@@ -22,6 +22,17 @@ const credentials = { botToken: "123456:test_token", chatId: "-123456" };
 const extensionPath = fileURLToPath(new URL("../index.ts", import.meta.url));
 const plain = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "");
 
+/** Wait until check() returns a value. */
+async function waitFor<T>(check: () => T, timeout = 3_000): Promise<NonNullable<T>> {
+  const start = Date.now();
+  for (;;) {
+    const value = check();
+    if (value) return value as NonNullable<T>;
+    if (Date.now() - start > timeout) throw new Error(`Timed out waiting for ${check}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 interface FixtureOptions {
   responses?: Array<"stop" | "error" | "retry">;
   reply?: string;
@@ -49,19 +60,29 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
   const oldDir = process.env.PI_CODING_AGENT_DIR;
   const oldSocket = process.env.PI_TELEGRAM_SOCKET;
   const oldPane = process.env.WEZTERM_PANE;
+  const oldTmux = process.env.TMUX;
+  const oldTmuxPane = process.env.TMUX_PANE;
+  const oldTmuxPanel = process.env.TMUX_PANEL;
   process.env.PI_CODING_AGENT_DIR = dir;
   // Never reach a remote-control daemon running on this computer, or type into a real pane.
   process.env.PI_TELEGRAM_SOCKET = join(dir, "no-daemon.sock");
   delete process.env.WEZTERM_PANE;
+  delete process.env.TMUX;
+  delete process.env.TMUX_PANE;
+  delete process.env.TMUX_PANEL;
   t.after(async () => {
     if (oldDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = oldDir;
     if (oldSocket === undefined) delete process.env.PI_TELEGRAM_SOCKET;
     else process.env.PI_TELEGRAM_SOCKET = oldSocket;
     if (oldPane !== undefined) process.env.WEZTERM_PANE = oldPane;
+    if (oldTmux !== undefined) process.env.TMUX = oldTmux;
+    if (oldTmuxPane !== undefined) process.env.TMUX_PANE = oldTmuxPane;
+    if (oldTmuxPanel !== undefined) process.env.TMUX_PANEL = oldTmuxPanel;
     await rm(dir, { recursive: true, force: true });
   });
-  await writeFile(config, JSON.stringify(credentials));
+  // Most tests expect notifications off, so they can turn them on themselves.
+  await writeFile(config, JSON.stringify({ ...credentials, notifyOnStart: false }));
 
   const deliveries: Delivery[] = [];
   t.mock.method(globalThis, "fetch", async (url: string | URL | Request, init?: RequestInit) => {
@@ -209,7 +230,7 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
   return { session, footer, config, deliveries, notices, started, receipts, calls: () => calls };
 }
 
-test("default off, missing credentials, toggle commands, and inline footer across reload", async (t) => {
+test("notifications off when the config says so, missing credentials, toggle commands, and inline footer across reload", async (t) => {
   const f = await fixture(t);
   const before = f.footer.render(100);
   await f.session.prompt("Finish without notifying.");
@@ -233,6 +254,8 @@ test("default off, missing credentials, toggle commands, and inline footer acros
     assert.ok(f.footer.render(width).every((line) => visibleWidth(line) <= width));
   }
   const render = FooterComponent.prototype.render;
+  // The next session starts with what the config says: here it turns notifications off.
+  await writeFile(f.config, JSON.stringify({ ...credentials, notifyOnStart: false }));
   await f.session.reload();
   assert.equal(FooterComponent.prototype.render, render);
   assert.ok(!plain(f.footer.render(100)[1]).includes("[Notification On]"));
@@ -241,6 +264,29 @@ test("default off, missing credentials, toggle commands, and inline footer acros
   await f.session.prompt("/notify off");
   assert.ok(!plain(f.footer.render(100)[1]).includes("[Notification On]"));
   assert.equal(f.deliveries.length, 0);
+});
+
+test("notifications start on when the config does not turn them off", async (t) => {
+  const f = await fixture(t);
+  // The fixture's config sets notifyOnStart: false.
+  assert.equal(plain(f.footer.render(100)[1]).includes("[Notification On]"), false);
+  await f.session.prompt("Quiet task.");
+  assert.equal(f.deliveries.length, 0);
+
+  // Without that setting, the next session starts with notifications on.
+  await writeFile(f.config, JSON.stringify(credentials));
+  await f.session.reload();
+  await waitFor(() => plain(f.footer.render(100)[1]).includes(" [Notification On]"));
+  await f.session.prompt("Loud task.");
+  await waitFor(() => f.deliveries.length === 1);
+  assert.match(f.deliveries[0].text, /\*\*Pi completed\*\*/);
+  assert.match(f.deliveries[0].text, /The task is complete\./);
+
+  // /notify still turns them off for this session.
+  await f.session.prompt("/notify off");
+  assert.ok(!plain(f.footer.render(100)[1]).includes("[Notification On]"));
+  await f.session.prompt("Quiet again.");
+  assert.equal(f.deliveries.length, 1);
 });
 
 test("one delivery and thread receipt after retries and queued follow-ups have finished", async (t) => {

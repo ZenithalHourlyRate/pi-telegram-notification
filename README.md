@@ -19,11 +19,12 @@ Create `~/.pi/agent/telegram-notification.json` (or under `PI_CODING_AGENT_DIR`)
 ```json
 {
   "botToken": "123456789:your_bot_token",
-  "chatId": "your_chat_id"
+  "chatId": "your_chat_id",
+  "notifyOnStart": true
 }
 ```
 
-Set the file permissions to `600`. Both fields are required. Credentials are read again before each send, so edits take effect immediately. This extension sends directly through Telegram's Bot API; it does not run the `tg` script.
+Set the file permissions to `600`. `botToken` and `chatId` are required. `notifyOnStart` is optional and defaults to `true`: an interactive session starts with notifications on, and `false` starts it with them off. Credentials are read again before each send, so edits take effect immediately. This extension sends directly through Telegram's Bot API; it does not run the `tg` script.
 
 ## Use
 
@@ -32,7 +33,7 @@ Set the file permissions to `600`. Both fields are required. Credentials are rea
 - `/notify off` disables them.
 - `/notify last` sends the last response now, for when you forgot to enable notifications. It does not turn notifications on.
 
-Notifications default to **off** on each session start, session switch, and `/reload`. If credentials are missing or invalid, `/notify` reports an error and leaves notifications off.
+Notifications start **on** in an interactive session, on each session start, session switch, and `/reload`, unless the config sets `"notifyOnStart": false`. `pi -p` and RPC sessions, including the subagents that Pi runs, stay off. If credentials are missing or invalid, the session stays off silently, and `/notify` reports an error and leaves notifications off.
 
 While enabled, ` [Notification On]` appears inline in Pi's stats footer, alongside other inline extensions such as pi-token-speed. It uses the built-in footer's render method, so it requires Pi's standard footer.
 
@@ -58,7 +59,7 @@ Every delivery adds a persistent receipt to the conversation. Delivery failures 
 
 ## Remote control
 
-A daemon polls the bot and passes your Telegram messages to running Pi sessions over a Unix socket. It also starts sessions in WezTerm, and opens closed ones again.
+A daemon polls the bot and passes your Telegram messages to running Pi sessions over a Unix socket. It also starts sessions in a terminal pane, a WezTerm tab or a tmux window, and opens closed ones again.
 
 ### Start the daemon
 
@@ -80,7 +81,7 @@ The daemon reads `telegram-notification.json` when it starts, so restart it afte
 {
   "botToken": "123456789:your_bot_token",
   "chatId": "your_user_id",
-  "remote": { "userId": your_user_id, "awayOnLock": true, "staleMinutes": 10 }
+  "remote": { "userId": 123456789, "awayOnLock": true, "staleMinutes": 10 }
 }
 ```
 
@@ -95,12 +96,12 @@ On the computer, the daemon creates its socket with mode 600, and Pi connects on
 Every interactive Pi session connects to the daemon when it starts, whether notifications are on or not. `pi -p` and RPC sessions do not.
 
 - **Reply** to any message about a session to send it a prompt: a notification, an entry of `/ls`, an answer, or your own earlier message. The session takes it like Enter in the editor: an idle session starts a run, and a working one gets it as a steering message. The daemon reacts with 👀 when Pi has taken the message. The answer comes back as a reply to your message, even with notifications off.
-- If the session is closed, the daemon opens it again with `pi --session` in a new WezTerm tab first.
+- If the session is closed, the daemon opens it again with `pi --session` in a new pane first: a WezTerm tab or a tmux window.
 - If you quote part of a message in the reply, the quote goes before your text.
 - **Attachments**: photos, files, audio, voice messages, videos, video messages, and stickers are saved under `~/.pi/agent/telegram-remote/files/YYYY-MM-DD/`, and the prompt lists their paths with type, size, and length. Pi decides how to use them, for example by transcribing a voice message. An album becomes one prompt. Bots can download files of up to 20 MB.
 - A message that is **not a reply** gets buttons: one for each running session, and **New session…**.
-- A **command** sent as a reply runs in that session as if you typed it on the computer, idle or working: built-in commands such as `/model sonnet` or `/session`, extension commands, skills, and prompt templates. Extensions cannot submit Pi's editor, so the extension puts the command in the editor and presses Enter through `wezterm cli send-text`. Text already in the editor is put back afterwards. The reply says when the command ran, and the new model if it changed. A command that opens a picker, such as `/resume`, opens it on the computer. `/model` without a model name is the exception: the bot shows the session's models as buttons.
-- Outside WezTerm, only what the extension API can run works, while the session is idle: extension commands, skills, prompt templates, `/compact [instructions]`, and `/reload`.
+- A **command** sent as a reply runs in that session as if you typed it on the computer, idle or working: built-in commands such as `/model sonnet` or `/session`, extension commands, skills, and prompt templates. Extensions cannot submit Pi's editor, so the extension puts the command in the editor and presses Enter through the terminal that runs it: `wezterm cli send-text` or `tmux send-keys`. Text already in the editor is put back afterwards. The reply says when the command ran, and the new model if it changed. A command that opens a picker, such as `/resume`, opens it on the computer. `/model` without a model name is the exception: the bot shows the session's models as buttons.
+- Outside WezTerm and tmux, only what the extension API can run works, while the session is idle: extension commands, skills, prompt templates, `/compact [instructions]`, and `/reload`.
 
 If Pi does not start working on a prompt within 10 seconds, for example because its model has no API key, the daemon replies with an error instead of 👀. A prompt that arrives while Pi compacts the conversation waits until compaction finishes, and the daemon says so.
 
@@ -108,12 +109,33 @@ If Pi does not start working on a prompt within 10 seconds, for example because 
 
 - `/ls` lists running sessions, one message each, with the name, directory, first prompt, state, and notification setting. Its buttons send the last answer, stop the run, and turn notifications on or off.
 - `/model` shows the models of the session you reply to as buttons, with the current one marked. Choosing a model changes it for that session only. `/model provider/model` in a reply still runs Pi's own command. The session must run the current extension: reload it after updating the extension.
-- `/new [directory] [prompt]` starts Pi in a new WezTerm tab. The directory is a path, or the start of a directory name from past sessions, as in `/new robo fix the loader`. Without one match, buttons offer the matching or recent directories. As a reply, it uses that session's directory. Attachments go with the prompt.
+- `/new [directory] [prompt]` starts Pi in a new pane, a WezTerm tab or a tmux window. The directory is a path, or the start of a directory name from past sessions, as in `/new robo fix the loader`. Without one match, buttons offer the matching or recent directories. As a reply, it uses that session's directory. Attachments go with the prompt.
 - `/stop` stops the session you reply to. Without a reply, it stops the only working session, or asks which one.
 - `/reload` reloads the session you reply to, or every running session without a reply, for example after updating an extension. A working session reloads when it stops. Only a command handler can reload Pi, so the extension adds `/telegram-reload` for this.
 - `/help` explains the above.
 
-To start Pi, the daemon runs `wezterm cli --prefer-mux spawn` into the first window of the WezTerm mux server, then waits up to 45 seconds for the new Pi to connect from that pane (`WEZTERM_PANE`). The mux server's `PATH` must find `pi`. `PI_TELEGRAM_WEZTERM` and `PI_TELEGRAM_PI` override the two commands.
+To start Pi, the daemon opens a detached pane in a terminal, then waits up to 45 seconds for the new Pi to connect from that pane. The terminal runs Pi in the session's own directory, so Pi files the session where `pi --resume` in that directory lists it. The daemon recognizes the new session by its pane ID: tmux's `%3`, or a WezTerm pane number.
+
+### Terminal backend
+
+The daemon can open Pi in WezTerm or in tmux. `remote.terminal` chooses:
+
+```json
+{
+  "botToken": "123456789:your_bot_token",
+  "chatId": "your_user_id",
+  "remote": { "userId": 123456789, "terminal": "tmux", "tmuxSession": "telegram" }
+}
+```
+
+- `terminal`: `"wezterm"`, `"tmux"`, or `"auto"` (the default). `"auto"` uses tmux when the daemon runs inside tmux or a tmux server is running, and WezTerm otherwise. It can also be an object, `{ "kind": "tmux", "session": "telegram" }`.
+- `tmuxSession`: the tmux session that gets a window for each Pi. The default is `telegram`, which the daemon creates when there is none. Without a name, the daemon takes the `telegram` session if it exists, else the session the daemon runs in, else the session a client is attached to. `session` inside `terminal` is the same setting.
+
+`PI_TELEGRAM_TERMINAL` and `PI_TELEGRAM_TMUX_SESSION` override both settings for one daemon run. The daemon logs the backend and the tmux session it uses when it starts.
+
+Each Pi reports the pane that runs it, so the daemon can match the Pi to the pane it opened, and the extension can press Enter in that pane. In tmux the pane is `TMUX_PANE`, which tmux sets; `TMUX_PANEL` is read first, for a setup that points a session at a different pane. In WezTerm it is `WEZTERM_PANE`.
+
+In WezTerm, the daemon runs `wezterm cli --prefer-mux spawn` into the first window of the WezTerm mux server. In tmux, it runs `tmux new-window` in the session, detached, so a new window does not take the focus away from what you are doing; `tmux new-session` creates the session when it is missing. The terminal server's `PATH` must find `pi`. `PI_TELEGRAM_WEZTERM`, `PI_TELEGRAM_TMUX`, and `PI_TELEGRAM_PI` override the executables.
 
 ### Away mode
 

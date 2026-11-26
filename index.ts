@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -28,6 +27,7 @@ import {
 } from "./src/remote/protocol.ts";
 import { formatRichMessage } from "./src/rich.ts";
 import { sendTelegram } from "./src/telegram.ts";
+import { backendOf, paneOf, pressEnter, type TerminalBackend } from "./src/terminal.ts";
 
 const ENTRY_TYPE = "telegram-notification";
 /** How long a prompt from Telegram may take to start a run before it counts as failed. */
@@ -37,15 +37,14 @@ const COMPACTION_WAIT_MS = 10 * 60_000;
 /** Only a command handler can reload Pi, so /reload from Telegram runs this command. */
 const RELOAD_COMMAND = "telegram-reload";
 
-/** Press Enter in a WezTerm pane, such as this session's own. */
-function pressEnter(pane: string): Promise<void> {
-  const wezterm = process.env.PI_TELEGRAM_WEZTERM ?? "wezterm";
-  return new Promise((resolve, reject) => {
-    execFile(wezterm, ["cli", "send-text", "--pane-id", pane, "--no-paste", "\r"], { timeout: 10_000 }, (error) => {
-      if (error) reject(error);
-      else resolve();
-    });
-  });
+/** The terminal that runs this session, and its pane, when it is WezTerm or tmux. */
+type SessionTerminal = { backend: TerminalBackend; pane: string };
+
+/** The backend and pane of this session's own terminal, from the variables that it sets. */
+function sessionTerminal(): SessionTerminal | undefined {
+  const backend = backendOf();
+  const pane = paneOf();
+  return backend && pane ? { backend, pane } : undefined;
 }
 
 interface NotificationReceipt {
@@ -90,6 +89,27 @@ export default function (pi: ExtensionAPI) {
     setFooterEnabled(enabled && ctx.mode === "tui");
     // setStatus also requests a render. Clearing this key adds no extra line.
     ctx.ui.setStatus(ENTRY_TYPE, undefined);
+  }
+
+  /**
+   * Start with notifications on, as the config asks. The config is read again on each session
+   * start, so an edit applies to the next session or /reload. Only interactive sessions notify:
+   * `pi -p`, RPC sessions, and the subagents they run would otherwise notify for every run.
+   */
+  async function startNotifications(ctx: ExtensionContext): Promise<void> {
+    let wanted = false;
+    if (ctx.mode === "tui") {
+      try {
+        wanted = (await readTelegramConfig(configPath)).notifyOnStart;
+      } catch {
+        // Without valid credentials, notifications stay off, and /notify says what is missing.
+      }
+    }
+    // A newer session start, or a shutdown, replaced this session while the config was read.
+    if (current !== ctx) return;
+    enabled = wanted;
+    updateFooter(ctx);
+    remote?.send({ type: "update", notify: enabled });
   }
 
   pi.registerEntryRenderer<NotificationReceipt>(ENTRY_TYPE, (entry, { expanded }, theme) => {
@@ -259,7 +279,7 @@ export default function (pi: ExtensionAPI) {
       version: PROTOCOL_VERSION,
       pid: process.pid,
       host: hostname(),
-      pane: process.env.WEZTERM_PANE,
+      pane: paneOf(),
       session: sessionInfo(ctx),
       state,
       notify: enabled,
@@ -348,14 +368,14 @@ export default function (pi: ExtensionAPI) {
 
   /**
    * Submit text as if typed in this session's editor: set the editor text, then press Enter
-   * through WezTerm, because extensions cannot submit the editor. Text already in the editor is
-   * put back afterwards. Returns false if the editor kept the text.
+   * in the session's terminal, because extensions cannot submit the editor. Text already in the
+   * editor is put back afterwards. Returns false if the editor kept the text.
    */
-  async function typeIntoEditor(ctx: ExtensionContext, pane: string, text: string): Promise<boolean> {
+  async function typeIntoEditor(ctx: ExtensionContext, terminal: SessionTerminal, text: string): Promise<boolean> {
     const draft = ctx.ui.getEditorText();
     ctx.ui.setEditorText(text);
     try {
-      await pressEnter(pane);
+      await pressEnter(terminal.backend, terminal.pane);
     } catch {
       ctx.ui.setEditorText(draft);
       return false;
@@ -430,11 +450,11 @@ export default function (pi: ExtensionAPI) {
         }
         // Built-in commands such as /model only run from the editor, so type the command there,
         // the same as at the computer. This runs every command, while idle or working.
-        const pane = process.env.WEZTERM_PANE;
-        if (pane) {
+        const terminal = sessionTerminal();
+        if (terminal) {
           const model = modelLabel(ctx);
           if (ctx.isIdle()) expectRun(ctx, request.replyTo);
-          if (!(await typeIntoEditor(ctx, pane, request.text))) {
+          if (!(await typeIntoEditor(ctx, terminal, request.text))) {
             clearExpected();
             answer(request.id, false, `Pi's editor did not take /${name}.`);
             return;
@@ -446,7 +466,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        // Without WezTerm, run what the extension API can. Queued text would reach the model
+        // Without WezTerm or tmux, run what the extension API can. Queued text would reach the model
         // as a plain message, so the session must be idle.
         if (!ctx.isIdle()) {
           answer(request.id, false, "Pi is working. Stop it or wait, then send the command again.");
@@ -459,7 +479,7 @@ export default function (pi: ExtensionAPI) {
         }
         const found = pi.getCommands().find((command) => command.name === name);
         if (!found) {
-          answer(request.id, false, `/${name} only runs from Pi's editor, and this session does not run in WezTerm, ` +
+          answer(request.id, false, `/${name} only runs from Pi's editor, and this session does not run in WezTerm or tmux, ` +
             "so it cannot be typed there.");
           return;
         }
@@ -563,6 +583,8 @@ export default function (pi: ExtensionAPI) {
       });
       remote.start();
     }
+    // Notifications start on unless the config turns them off.
+    void startNotifications(ctx);
   });
 
   pi.on("session_info_changed", (_event, ctx) => {

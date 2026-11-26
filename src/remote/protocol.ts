@@ -42,7 +42,7 @@ export interface Hello {
   version: number;
   pid: number;
   host: string;
-  /** WEZTERM_PANE, which matches the pane ID that `wezterm cli spawn` prints. */
+  /** The pane that runs the session: TMUX_PANEL or TMUX_PANE in tmux, WEZTERM_PANE in WezTerm. */
   pane?: string;
   session: SessionInfo;
   state: SessionState;

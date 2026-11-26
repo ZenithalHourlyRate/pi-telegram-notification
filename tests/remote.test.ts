@@ -14,10 +14,11 @@ import {
   SettingsManager,
   type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { readRemoteSettings } from "../src/config.ts";
+import { readRemoteSettings, readTelegramConfig } from "../src/config.ts";
 import { Daemon } from "../src/daemon/daemon.ts";
 import { RemoteClient } from "../src/remote/client.ts";
 import { PROTOCOL_VERSION, type DaemonMessage } from "../src/remote/protocol.ts";
+import type { TerminalBackend } from "../src/terminal.ts";
 
 const TOKEN = "123456:remote_test";
 const CHAT = 4242;
@@ -120,25 +121,39 @@ interface FixtureOptions {
   waitForAbort?: boolean;
   /** WEZTERM_PANE of the session. */
   pane?: string;
+  /** The terminal that the daemon opens Pi in. */
+  backend?: TerminalBackend;
+  /** TMUX_PANE of the session. */
+  tmuxPane?: string;
+  /** TMUX_PANEL of the session, which overrides TMUX_PANE. */
+  tmuxPanel?: string;
 }
 
 async function fixture(t: TestContext, options: FixtureOptions = {}) {
   const dir = await mkdtemp(join(tmpdir(), "pi-telegram-remote-"));
   const wezterm = join(dir, "wezterm");
+  const tmux = join(dir, "tmux");
   const env: Record<string, string | undefined> = {
     PI_CODING_AGENT_DIR: dir,
     PI_TELEGRAM_SOCKET: join(dir, "daemon.sock"),
     PI_TELEGRAM_API_BASE: API,
-    // Never type into a real WezTerm pane, such as the one that runs these tests.
+    // Never type into a real pane, such as the one that runs these tests.
     PI_TELEGRAM_WEZTERM: wezterm,
+    PI_TELEGRAM_TMUX: tmux,
     WEZTERM_PANE: options.pane,
+    // These tests may run inside tmux. A session's own pane is the one in the options.
+    TMUX: options.tmuxPane || options.tmuxPanel ? "/tmp/pi-telegram-test" : undefined,
+    TMUX_PANE: options.tmuxPane,
+    TMUX_PANEL: options.tmuxPanel,
   };
   const old = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
-  await writeFile(join(dir, "telegram-notification.json"), JSON.stringify({ botToken: TOKEN, chatId: String(CHAT) }));
+  // Most tests expect notifications off, so they can turn them on themselves.
+  await writeFile(join(dir, "telegram-notification.json"),
+    JSON.stringify({ botToken: TOKEN, chatId: String(CHAT), notifyOnStart: false }));
 
   const telegram = new FakeTelegram();
   t.mock.method(globalThis, "fetch", (url: string | URL | Request, init?: RequestInit) => telegram.fetch(String(url), init));
@@ -146,12 +161,12 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
   const logs: string[] = [];
   const daemon = new Daemon({
     telegram: { botToken: TOKEN, chatId: String(CHAT) },
-    remote: { userId: String(CHAT), awayOnLock: false, staleMinutes: 10 },
+    remote: { userId: String(CHAT), awayOnLock: false, staleMinutes: 10, terminal: "auto", tmuxSession: undefined },
     socket: join(dir, "daemon.sock"),
     dataDir: join(dir, "telegram-remote"),
     linksPath: join(dir, "telegram-remote", "messages.jsonl"),
     sessionsDir: join(dir, "sessions"),
-    commands: { wezterm, pi: "pi" },
+    commands: { wezterm, tmux, backend: options.backend ?? "wezterm", pi: "pi" },
     log: (message) => logs.push(message),
   });
   await daemon.start();
@@ -249,19 +264,27 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
     resourceLoader: loader,
     tools: [],
   });
-  // The editor submits its text each time the fake wezterm is called to press Enter.
+  // The editor submits its text each time the terminal is asked to press Enter.
   const editor = { text: "", submitted: [] as string[], presses: 0 };
   const weztermCalls = join(dir, "wezterm-calls");
+  const tmuxCalls = join(dir, "tmux-calls");
+  const presses = () => {
+    const weztermPresses = existsSync(weztermCalls)
+      ? readFileSync(weztermCalls, "utf8").split("\n").filter((line) => line.includes("send-text")).length
+      : 0;
+    const tmuxPresses = existsSync(tmuxCalls)
+      ? readFileSync(tmuxCalls, "utf8").split("\n").filter((line) => /send-keys .* Enter$/.test(line)).length
+      : 0;
+    return weztermPresses + tmuxPresses;
+  };
   const ui = {
     notify: () => {},
     setStatus: () => {},
     setEditorText: (text: string) => { editor.text = text; },
     getEditorText: () => {
-      const presses = existsSync(weztermCalls)
-        ? readFileSync(weztermCalls, "utf8").split("\n").filter((line) => line.includes("send-text")).length
-        : 0;
-      if (presses > editor.presses) {
-        editor.presses = presses;
+      const count = presses();
+      if (count > editor.presses) {
+        editor.presses = count;
         editor.submitted.push(editor.text);
         editor.text = "";
       }
@@ -307,7 +330,7 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
     return release;
   };
   return {
-    dir, telegram, daemon, session, prompts, started, logs, wezterm, weztermCalls, editor, receipts, hold,
+    dir, telegram, daemon, session, prompts, started, logs, wezterm, tmux, weztermCalls, tmuxCalls, editor, receipts, hold,
     live: () => daemon.sessions()[0],
   };
 }
@@ -552,12 +575,12 @@ test("in WezTerm, a command in a reply is typed into the session's editor, so ev
   assert.equal(f.prompts.length, 1);
 });
 
-test("outside WezTerm, a command in a reply runs if the extension API can run it", async (t) => {
+test("outside WezTerm and tmux, a command in a reply runs if the extension API can run it", async (t) => {
   const f = await fixture(t);
   const notice = await notification(f);
   f.telegram.send({ text: "/model gpt", reply_to_message: { message_id: notice } });
   const refused = await waitFor(() => f.telegram.sent("sendMessage")[0]);
-  assert.match(refused.body.text, /^\/model only runs from Pi's editor, and this session does not run in WezTerm/);
+  assert.match(refused.body.text, /^\/model only runs from Pi's editor, and this session does not run in WezTerm or tmux/);
 
   f.telegram.send({ text: "/notify on", reply_to_message: { message_id: notice } });
   await waitFor(() => f.live().notify);
@@ -673,12 +696,12 @@ test("the daemon does not start unless remote.userId is set and is the user of c
   t.after(() => rm(dir, { recursive: true, force: true }));
   const daemon = (userId: string | undefined) => new Daemon({
     telegram: { botToken: TOKEN, chatId: String(CHAT) },
-    remote: { userId, awayOnLock: false, staleMinutes: 10 },
+    remote: { userId, awayOnLock: false, staleMinutes: 10, terminal: "auto", tmuxSession: undefined },
     socket: join(dir, "daemon.sock"),
     dataDir: join(dir, "telegram-remote"),
     linksPath: join(dir, "telegram-remote", "messages.jsonl"),
     sessionsDir: join(dir, "sessions"),
-    commands: { wezterm: "wezterm", pi: "pi" },
+    commands: { wezterm: "wezterm", tmux: "tmux", backend: "wezterm", pi: "pi" },
     log: () => {},
   });
   await assert.rejects(daemon(undefined).start(), /^Error: Set remote\.userId/);
@@ -716,4 +739,239 @@ test("/reload reloads the session you reply to, or every session, and a working 
   await reconnected(working);
   // The aborted run still answered first.
   assert.match(f.telegram.sent("sendRichMessage").at(-1)!.body.rich_message.markdown, /Pi aborted/);
+});
+
+/** A fake tmux that records its calls and answers as if the "telegram" session existed. */
+async function fakeTmux(f: Awaited<ReturnType<typeof fixture>>, pane: string): Promise<string> {
+  const calls = f.tmuxCalls;
+  await writeFile(f.tmux, [
+    "#!/bin/sh",
+    `printf '%s\\n' "$*" >> '${calls}'`,
+    "case \"$1\" in",
+    '  list-sessions) echo "telegram" ;;',
+    "  has-session) exit 0 ;;",
+    `  new-window|new-session) echo "${pane}" ;;`,
+    "esac",
+  ].join("\n"));
+  await chmod(f.tmux, 0o755);
+  return calls;
+}
+
+/** A session file of a project, as Pi writes it, so the daemon can find and reopen the session. */
+async function sessionFile(
+  sessions: string,
+  folder: string,
+  id: string,
+  cwd: string,
+): Promise<string> {
+  const dir = join(sessions, folder);
+  await mkdir(dir, { recursive: true });
+  const file = join(dir, `2026-01-01T00-00-00-000Z_${id}.jsonl`);
+  await writeFile(file, `${JSON.stringify({ type: "session", version: 3, id, cwd })}\n`);
+  return file;
+}
+
+test("/new in tmux opens a window of the telegram session in the project directory", async (t) => {
+  const f = await fixture(t, { backend: "tmux" });
+  const project = join(f.dir, "RoboProject");
+  await mkdir(project);
+  await sessionFile(join(f.dir, "sessions"), "--robo--", "11111111-2222-3333-4444-555555555555", project);
+  const calls = await fakeTmux(f, "%77");
+
+  const asked = f.telegram.send({ text: "/new robo fix the loader\nand run the tests" });
+  await waitFor(async () => (await readFile(calls, "utf8").catch(() => "")).includes("new-window"));
+
+  // The window runs in the project's directory, which is where Pi files the session and where
+  // pi --resume lists it.
+  assert.deepEqual((await readFile(calls, "utf8")).trim().split("\n"), [
+    "has-session -t =telegram",
+    `new-window -d -t =telegram: -P -F #{pane_id} -c ${project} -- pi`,
+  ]);
+
+  // Stands in for the Pi that tmux would start in the new window.
+  const requests: DaemonMessage[] = [];
+  const client: RemoteClient = new RemoteClient({
+    path: join(f.dir, "daemon.sock"),
+    hello: () => ({
+      type: "hello",
+      version: PROTOCOL_VERSION,
+      pid: 1,
+      host: "test",
+      pane: "%77",
+      session: { id: "new-session", cwd: project },
+      state: "idle",
+      notify: false,
+    }),
+    onMessage: (message) => {
+      requests.push(message);
+      if (message.type !== "away") client.send({ type: "result", id: message.id, ok: true });
+    },
+  });
+  client.start();
+  t.after(() => client.close());
+
+  const prompt = await waitFor(() => requests.find((message) => message.type === "prompt"));
+  assert.deepEqual(prompt.type === "prompt" && [prompt.text, prompt.replyTo], ["fix the loader\nand run the tests", asked]);
+  const started = await waitFor(() => f.telegram.sent("sendMessage").find((call) => /^Started/.test(call.body.text)));
+  assert.equal(started.body.text, `Started a session in ${project}.`);
+});
+
+test("/new in tmux creates the telegram session when there is none", async (t) => {
+  const f = await fixture(t, { backend: "tmux" });
+  const project = join(f.dir, "RoboProject");
+  await mkdir(project);
+  await sessionFile(join(f.dir, "sessions"), "--robo--", "11111111-2222-3333-4444-555555555555", project);
+  const calls = f.tmuxCalls;
+  await writeFile(f.tmux, [
+    "#!/bin/sh",
+    `printf '%s\\n' "$*" >> '${calls}'`,
+    "case \"$1\" in",
+    "  list-sessions) exit 1 ;;",
+    "  has-session) exit 1 ;;",
+    '  new-session) echo "%78" ;;',
+    "esac",
+  ].join("\n"));
+  await chmod(f.tmux, 0o755);
+
+  f.telegram.send({ text: "/new robo fix the loader" });
+  await waitFor(async () => (await readFile(calls, "utf8").catch(() => "")).includes("new-session"));
+  const lines = (await readFile(calls, "utf8")).trim().split("\n");
+  assert.deepEqual(lines.filter((line) => line.startsWith("has-session")), ["has-session -t =telegram"]);
+  assert.equal(lines.some((line) => line.startsWith("new-window")), false);
+  assert.equal(lines.at(-1),
+    `new-session -d -s telegram -P -F #{pane_id} -c ${project} -- pi`);
+
+  // Stands in for the Pi that tmux would start, so the daemon stops waiting for it.
+  const client: RemoteClient = new RemoteClient({
+    path: join(f.dir, "daemon.sock"),
+    hello: () => ({
+      type: "hello",
+      version: PROTOCOL_VERSION,
+      pid: 1,
+      host: "test",
+      pane: "%78",
+      session: { id: "new-session", cwd: project },
+      state: "idle",
+      notify: false,
+    }),
+    onMessage: (message) => {
+      if (message.type !== "away") client.send({ type: "result", id: message.id, ok: true });
+    },
+  });
+  client.start();
+  t.after(() => client.close());
+  await waitFor(() => f.daemon.sessions().some((live) => live.pane === "%78"));
+});
+
+test("in tmux, a command in a reply is typed into the session's editor, so every command runs", async (t) => {
+  const f = await fixture(t, { backend: "tmux", tmuxPane: "%7" });
+  const notice = await notification(f);
+  await fakeTmux(f, "%7");
+  f.editor.text = "unsent draft";
+
+  const asked = f.telegram.send({ text: "/model gpt-x", reply_to_message: { message_id: notice } });
+  const said = await waitFor(() => f.telegram.sent("sendMessage").find((call) => call.body.reply_parameters?.message_id === asked));
+  assert.equal(said.body.text, "Ran /model on the computer.");
+  assert.deepEqual(f.editor.submitted, ["/model gpt-x"]);
+  assert.equal(f.editor.text, "unsent draft");
+  assert.deepEqual((await readFile(f.tmuxCalls, "utf8")).split("\n").filter(Boolean), ["send-keys -t %7 Enter"]);
+  assert.equal(f.prompts.length, 1);
+});
+
+test("TMUX_PANEL names the pane of a session, for a session that must use another pane", async (t) => {
+  const f = await fixture(t, { backend: "tmux", tmuxPane: "%7", tmuxPanel: "%8" });
+  assert.equal(f.live().pane, "%8");
+});
+
+test("a closed session opens again in tmux in its own directory, with pi --session", async (t) => {
+  const f = await fixture(t, { backend: "tmux" });
+  const project = join(f.dir, "RoboProject");
+  await mkdir(project);
+  const id = "11111111-2222-3333-4444-555555555555";
+  const file = await sessionFile(join(f.dir, "sessions"), "--robo--", id, project);
+  // A message about that session, such as a notification, that is replied to now.
+  await mkdir(join(f.dir, "telegram-remote"), { recursive: true });
+  await writeFile(join(f.dir, "telegram-remote", "messages.jsonl"),
+    `${JSON.stringify({ message: 900, session: id, file, cwd: project })}\n`);
+  const calls = await fakeTmux(f, "%88");
+
+  const asked = f.telegram.send({ text: "Keep going.", reply_to_message: { message_id: 900 } });
+  await waitFor(async () => (await readFile(calls, "utf8").catch(() => "")).includes("new-window"));
+  // Pi runs in the session's own directory, so it appends to the same file that pi --resume lists.
+  assert.equal((await readFile(calls, "utf8")).trim().split("\n").at(-1),
+    `new-window -d -t =telegram: -P -F #{pane_id} -c ${project} -- pi --session ${file}`);
+
+  const requests: DaemonMessage[] = [];
+  const client: RemoteClient = new RemoteClient({
+    path: join(f.dir, "daemon.sock"),
+    hello: () => ({
+      type: "hello",
+      version: PROTOCOL_VERSION,
+      pid: 1,
+      host: "test",
+      pane: "%88",
+      session: { id, file, cwd: project },
+      state: "idle",
+      notify: false,
+    }),
+    onMessage: (message) => {
+      requests.push(message);
+      if (message.type !== "away") client.send({ type: "result", id: message.id, ok: true });
+    },
+  });
+  client.start();
+  t.after(() => client.close());
+
+  const prompt = await waitFor(() => requests.find((message) => message.type === "prompt"));
+  assert.deepEqual(prompt.type === "prompt" && [prompt.text, prompt.replyTo], ["Keep going.", asked]);
+  const opened = await waitFor(() => f.telegram.sent("sendMessage").find((call) => /again in a new/.test(call.body.text)));
+  assert.match(opened.body.text, /again in a new tmux window\.$/);
+});
+
+test("remote.terminal takes a backend name, or an object with a tmux session", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-remote-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const settings = async (remote: unknown) => {
+    const path = join(dir, "config.json");
+    await writeFile(path, JSON.stringify({ botToken: TOKEN, chatId: String(CHAT), remote }));
+    return readRemoteSettings(path);
+  };
+  // The form that this config already had: { kind, session }.
+  assert.deepEqual(await settings({ userId: CHAT, terminal: { kind: "tmux", session: "telegram" } }), {
+    userId: String(CHAT),
+    awayOnLock: true,
+    staleMinutes: 10,
+    terminal: "tmux",
+    tmuxSession: "telegram",
+  });
+  assert.equal((await settings({ terminal: "wezterm" })).terminal, "wezterm");
+  assert.equal((await settings({ terminal: { kind: "tmux" } })).tmuxSession, undefined);
+  assert.equal((await settings({ terminal: "wezterm", tmuxSession: "work" })).tmuxSession, "work");
+  assert.equal((await settings({ terminal: "unknown" })).terminal, "auto");
+  const defaults = await settings({});
+  assert.equal(defaults.terminal, "auto");
+  assert.equal(defaults.tmuxSession, undefined);
+
+  // Notifications start on by default, and an explicit false turns that off.
+  const config = join(dir, "config.json");
+  assert.equal((await readTelegramConfig(config)).notifyOnStart, true);
+  await writeFile(config, JSON.stringify({ botToken: TOKEN, chatId: String(CHAT), notifyOnStart: false }));
+  assert.equal((await readTelegramConfig(config)).notifyOnStart, false);
+});
+
+test("notifications start on in a session unless the config turns them off", async (t) => {
+  const f = await fixture(t);
+  // The fixture's config sets notifyOnStart: false.
+  assert.equal(f.live().notify, false);
+
+  // Without that setting, the next session start turns notifications on.
+  await writeFile(join(f.dir, "telegram-notification.json"), JSON.stringify({ botToken: TOKEN, chatId: String(CHAT) }));
+  await f.session.reload();
+  const live = await waitFor(() => f.daemon.sessions().find((session) => session.notify));
+  assert.equal(live.notify, true);
+
+  // A run in that session reports to Telegram, without /notify on.
+  await f.session.prompt("Task.");
+  const sent = await waitFor(() => f.telegram.sent("sendRichMessage")[0]);
+  assert.match(sent.body.rich_message.markdown, /Done: Task\./);
 });

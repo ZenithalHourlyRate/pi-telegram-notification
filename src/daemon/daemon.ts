@@ -7,33 +7,34 @@ import { callTelegram, downloadTelegramFile, TelegramError } from "../api.ts";
 import type { RemoteSettings, TelegramConfig } from "../config.ts";
 import { LinkIndex, type MessageLink } from "../remote/links.ts";
 import type { ModelChoice } from "../remote/protocol.ts";
+import { spawnPi, type TerminalCommands } from "../terminal.ts";
 import { watchScreenLock } from "./away.ts";
 import { findSessionFile, isDirectory, matchDirectory, readSessionHeader, recentDirectories, tildify } from "./dirs.ts";
 import { attachmentsOf, composePrompt, saveAttachments } from "./files.ts";
 import { SessionHub, type LiveSession } from "./hub.ts";
 import { readFirstPrompt } from "./session-prompt.ts";
-import { spawnPi, type SpawnCommands } from "./spawn.ts";
 import type { TgButton, TgCallbackQuery, TgChat, TgMessage, TgUpdate } from "./types.ts";
 
 /** Telegram sends each item of an album as its own message, close together. */
 const ALBUM_WAIT_MS = 1_500;
 /** How long buttons that hold a message keep working. */
 const PENDING_MS = 60 * 60 * 1000;
-/** How long a Pi opened in WezTerm may take to connect. */
+/** How long a Pi opened in a new pane may take to connect. */
 const CONNECT_TIMEOUT_MS = 45_000;
 const MAX_CHOICES = 8;
 /** Models per page of the /model choice. */
 const MODEL_PAGE_SIZE = 8;
 
 export interface DaemonOptions {
-  telegram: TelegramConfig;
+  /** The bot credentials. The daemon sends messages itself, so it needs nothing else. */
+  telegram: Pick<TelegramConfig, "botToken" | "chatId">;
   remote: RemoteSettings;
   socket: string;
   /** Holds the update offset and the files sent from Telegram. */
   dataDir: string;
   linksPath: string;
   sessionsDir: string;
-  commands: SpawnCommands;
+  commands: TerminalCommands;
   log?: (message: string) => void;
 }
 
@@ -53,7 +54,7 @@ type SendOptions = {
 
 /**
  * The only process that polls the bot. It routes Telegram messages to Pi sessions
- * over a Unix socket, and opens new sessions in WezTerm.
+ * over a Unix socket, and opens new sessions in a terminal pane: a WezTerm tab or a tmux window.
  */
 export class Daemon {
   private readonly options: DaemonOptions;
@@ -276,7 +277,7 @@ export class Daemon {
 
   private async help(messageId: number): Promise<void> {
     const lines = [
-      "Reply to a message about a session to send that session a prompt. If the session is closed, it opens again in a new WezTerm tab.",
+      "Reply to a message about a session to send that session a prompt. If the session is closed, it opens again in a new pane.",
       "Photos, files, voice messages and other attachments are saved on the computer, and Pi gets their paths.",
       "A message that is not a reply asks which session it is for.",
       "A command sent as a reply, such as /model or /notify on, runs in that session as if typed on the computer.",
@@ -369,14 +370,17 @@ export class Daemon {
     const cwd = (await readSessionHeader(file))?.cwd ?? link.cwd;
     if (!cwd || !isDirectory(cwd)) throw new Error(`it is not running, and its directory ${cwd ?? ""} is gone.`);
     const reopened = await this.launch(cwd, ["--session", file]);
-    await this.say(messageId, `Opened ${label(reopened)} again in a new WezTerm tab.`, { session: reopened });
+    await this.say(messageId, `Opened ${label(reopened)} again in a new ${paneName(this.options.commands)}.`, { session: reopened });
     return reopened;
   }
 
-  /** Start Pi in WezTerm and wait until it connects. */
+  /**
+   * Start Pi in a new pane and wait until it connects. The pane's directory is the session's
+   * directory, so Pi files the session where `pi --resume` in that directory lists it.
+   */
   private async launch(cwd: string, args: string[]): Promise<LiveSession> {
     const pane = await spawnPi(this.options.commands, cwd, args);
-    this.log(`Started Pi in WezTerm pane ${pane}, in ${cwd}.`);
+    this.log(`Started Pi in ${paneName(this.options.commands)} ${pane}, in ${cwd}.`);
     return this.hub.waitFor((live) => live.pane === pane, CONNECT_TIMEOUT_MS);
   }
 
@@ -776,6 +780,11 @@ function linkTo(message: number, live: LiveSession): MessageLink {
 
 function label(live: LiveSession): string {
   return live.session.name || `${basename(live.session.cwd) || live.session.cwd} (${live.session.id.slice(0, 8)})`;
+}
+
+/** What a new pane is called in Telegram messages, in the terminal that the daemon opens. */
+function paneName(commands: TerminalCommands): string {
+  return commands.backend === "tmux" ? "tmux window" : "WezTerm tab";
 }
 
 function stateIcon(live: LiveSession): string {
