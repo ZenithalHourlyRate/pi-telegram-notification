@@ -1,5 +1,4 @@
 import { open } from "node:fs/promises";
-import { truncate } from "../format.ts";
 
 /**
  * What a running Pi session is doing right now, read from the end of its
@@ -230,4 +229,9 @@ function string(value: unknown): string | undefined {
 
 function number(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Cut text to at most `length` characters. Kept local: the daemon must not pull in Pi's TUI packages. */
+function truncate(text: string, length: number): string {
+  return text.length <= length ? text : `${text.slice(0, Math.max(0, length - 1)).trimEnd()}…`;
 }
