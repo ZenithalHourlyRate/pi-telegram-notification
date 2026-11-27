@@ -85,6 +85,7 @@ export type Request =
   | { type: "model"; id: string; provider: string; modelId: string }
   | { type: "stop"; id: string }
   | { type: "notify"; id: string; enabled: boolean }
+  | { type: "summary"; id: string; replyTo: number }
   | { type: "last"; id: string; replyTo: number };
 
 /** While away, every session notifies when it stops. */

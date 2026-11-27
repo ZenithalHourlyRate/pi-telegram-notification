@@ -7,6 +7,8 @@ export interface TelegramConfig {
   chatId: string;
   /** Whether an interactive session starts with notifications on. Default true. */
   notifyOnStart: boolean;
+  /** The model that writes status summaries, as "provider/modelId". Work stays on the session's model. */
+  summaryModel?: string;
 }
 
 export interface RemoteSettings {
@@ -68,10 +70,12 @@ export async function readTelegramConfig(path: string): Promise<TelegramConfig> 
     throw new Error(`Telegram chatId is missing in ${path}.`);
   }
 
+  const summaryModel = typeof config.summaryModel === "string" ? config.summaryModel.trim() : "";
   return {
     botToken: config.botToken.trim(),
     chatId: String(config.chatId).trim(),
     notifyOnStart: typeof config.notifyOnStart === "boolean" ? config.notifyOnStart : true,
+    ...(summaryModel ? { summaryModel } : {}),
   };
 }
 

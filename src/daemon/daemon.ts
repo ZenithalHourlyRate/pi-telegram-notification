@@ -8,6 +8,7 @@ import type { RemoteSettings, TelegramConfig } from "../config.ts";
 import { LinkIndex, type MessageLink } from "../remote/links.ts";
 import type { ModelChoice } from "../remote/protocol.ts";
 import { spawnPi, type TerminalCommands } from "../terminal.ts";
+import { readActivity, type Activity } from "./activity.ts";
 import { watchScreenLock } from "./away.ts";
 import { findSessionFile, isDirectory, matchDirectory, readSessionHeader, recentDirectories, tildify } from "./dirs.ts";
 import { attachmentsOf, composePrompt, saveAttachments } from "./files.ts";
@@ -22,6 +23,8 @@ const PENDING_MS = 60 * 60 * 1000;
 /** How long a Pi opened in a new pane may take to connect. */
 const CONNECT_TIMEOUT_MS = 45_000;
 const MAX_CHOICES = 8;
+/** Summarizing asks a model, through the session, so it takes longer than a button round trip. */
+const SUMMARY_TIMEOUT_MS = 120_000;
 /** Models per page of the /model choice. */
 const MODEL_PAGE_SIZE = 8;
 
@@ -247,6 +250,7 @@ export class Daemon {
     const name = command?.name.toLowerCase();
     if (name === "start" || name === "help") return this.help(id);
     if (name === "ls") return this.list();
+    if (name === "dashboard" || name === "d") return this.dashboard();
 
     const replied = message.reply_to_message?.message_id;
     const link = replied === undefined ? undefined : await this.links.lookup(replied);
@@ -283,6 +287,7 @@ export class Daemon {
       "A command sent as a reply, such as /model or /notify on, runs in that session as if typed on the computer.",
       "",
       "/ls – running sessions, with buttons for the last answer, stopping, and notifications",
+      "/dashboard – what each session is doing right now, where it is stuck, and for how long (alias /d)",
       "/model – choose the session's model with buttons",
       "/new [directory] [prompt] – start a session. The directory can be the start of a project's name. As a reply, it starts in that session's directory.",
       "/stop – stop the session you reply to, or the only one working",
@@ -308,6 +313,30 @@ export class Daemon {
       if (this.entries.size <= 500) break;
       this.entries.delete(old);
     }
+  }
+
+  /**
+   * One message per running session: the tool it is inside, the last things it
+   * said, and how long ago anything happened. Read from the session files, so a
+   * session in a long tool call still answers, and nothing is asked of the agent.
+   */
+  private async dashboard(): Promise<void> {
+    const sessions = this.hub.sessions();
+    if (!sessions.length) {
+      await this.say(undefined, "No Pi session is running. Send /new to start one.");
+      return;
+    }
+    await this.readFirstPrompts(sessions);
+    for (const live of sessions) {
+      const activity = await this.activityOf(live);
+      await this.say(undefined, describeActivity(live, activity), { html: true, keyboard: dashboardKeyboard(live), session: live });
+    }
+  }
+
+  /** The activity of one session, or undefined when it has no session file yet. */
+  private async activityOf(live: LiveSession): Promise<Activity | undefined> {
+    const file = live.session.file ?? await findSessionFile(this.options.sessionsDir, live.session.id);
+    return file ? readActivity(file) : undefined;
   }
 
   /**
@@ -540,7 +569,7 @@ export class Daemon {
   private async onCallback(query: TgCallbackQuery): Promise<void> {
     const [action = "", key = "", index = "0"] = (query.data ?? "").split(":");
     const where = query.message?.message_id;
-    if ("lxof".includes(action) && action.length === 1) return this.onSessionButton(query, action, key);
+    if ("lxofap".includes(action) && action.length === 1) return this.onSessionButton(query, action, key);
 
     const pending = this.recall(key);
     if (!pending) {
@@ -613,6 +642,19 @@ export class Daemon {
       return;
     }
     const where = query.message?.message_id;
+    if (action === "a") {
+      if (where === undefined) return this.answer(query.id, "This message is gone.");
+      const activity = await this.activityOf(live);
+      await this.edit(where, describeActivity(live, activity), { html: true, keyboard: dashboardKeyboard(live) });
+      return this.answer(query.id, "Refreshed.");
+    }
+    if (action === "p") {
+      // The session writes the summary and sends it, so this returns at once and
+      // the queue is free for other Telegram messages while the model answers.
+      await this.answer(query.id, "Asking for a summary…");
+      void this.requestSummary(live, where);
+      return;
+    }
     const result = action === "l"
       ? await this.hub.request(live, { type: "last", replyTo: where ?? 0 })
       : action === "x"
@@ -623,6 +665,16 @@ export class Daemon {
     if (where === undefined || !result.ok) return;
     if (this.entries.has(where)) await this.edit(where, describe(live), { html: true, keyboard: sessionKeyboard(live) });
     else if (action === "x") await this.edit(where, `Stopping ${label(live)}.`);
+  }
+
+  /** Ask the session for a status summary; the reply arrives as its own Telegram message. */
+  private async requestSummary(live: LiveSession, replyTo: number | undefined): Promise<void> {
+    try {
+      const result = await this.hub.request(live, { type: "summary", replyTo: replyTo ?? 0 }, SUMMARY_TIMEOUT_MS);
+      if (!result.ok) await this.say(replyTo, `No summary: ${result.message ?? "Pi did not answer."}`, { session: live });
+    } catch (error) {
+      await this.say(replyTo, `No summary: ${errorText(error)}`, { session: live });
+    }
   }
 
   private remember(pending: Pending): string {
@@ -814,6 +866,75 @@ function sessionKeyboard(live: LiveSession): TgButton[][] {
   if (live.state !== "idle") row.push(button("Stop", `x:${id}`));
   row.push(live.notify ? button("Notify off", `f:${id}`) : button("Notify on", `o:${id}`));
   return [row];
+}
+
+/** Buttons of a /dashboard entry: it is a snapshot, so it can be taken again. */
+export function dashboardKeyboard(live: LiveSession): TgButton[][] {
+  const id = live.session.id;
+  const row = [button("Refresh", `a:${id}`), button("Summary", `p:${id}`), button("Last answer", `l:${id}`)];
+  if (live.state !== "idle") row.push(button("Stop", `x:${id}`));
+  return [row];
+}
+
+/**
+ * One session as a few lines: state and how long it has been in it, the tool it
+ * is inside with its command, the last things it said, and anything that looks
+ * stuck. The last line is the tally, so a wrong answer is easy to spot.
+ */
+export function describeActivity(live: LiveSession, activity: Activity | undefined): string {
+  const now = Date.now();
+  const state = live.state === "working"
+    ? `working ${duration(now - (activity?.turnStartedAt ?? live.since))}`
+    : live.state === "waiting" ? "waiting for you on the computer" : `idle ${duration(now - live.since)}`;
+  const lines = [
+    `${stateIcon(live)} <b>${escapeHtml(label(live))}</b> · ${escapeHtml(state)}`,
+    `<code>${escapeHtml(tildify(live.session.cwd))}</code>`,
+  ];
+  if (activity?.lastUser) lines.push(`you: <i>“${escapeHtml(activity.lastUser)}”</i>`);
+
+  const running = activity?.running ?? [];
+  for (const run of running) {
+    const age = duration(now - run.since);
+    const hint = run.hint ? ` · <code>${escapeHtml(run.hint)}</code>` : "";
+    lines.push(`🛠 <b>${escapeHtml(run.tool)}</b>${hint} · ${age}${stuck(run, now)}`);
+  }
+  if (!running.length && activity?.lastTool) {
+    const tool = activity.lastTool;
+    lines.push(`${tool.ok ? "✅" : "❌"} ${escapeHtml(tool.tool)} ${duration(now - tool.at)} ago`);
+  }
+
+  const progress = activity?.progress ?? [];
+  if (progress.length) {
+    lines.push("", `<b>last said</b>`);
+    for (const line of progress) lines.push(`· ${escapeHtml(line)}`);
+  } else if (activity?.lastAssistant) {
+    lines.push("", `· ${escapeHtml(activity.lastAssistant)}`);
+  }
+
+  const tally: string[] = [];
+  if (activity) {
+    if (activity.toolCalls) tally.push(`${activity.toolCalls} tool calls`);
+    if (activity.errors) tally.push(`${activity.errors} failed`);
+    if (activity.lastEventAt) tally.push(`last activity ${duration(now - activity.lastEventAt)} ago`);
+    if (activity.model) tally.push(escapeHtml(activity.model));
+  }
+  if (tally.length) lines.push("", `<i>${tally.join(" · ")}</i>`);
+  return lines.join("\n");
+}
+
+/** A warning for the two ways a session hangs: a tool that never returns, and silence. */
+function stuck(run: { since: number }, now: number): string {
+  const minutes = (now - run.since) / 60_000;
+  return minutes >= 10 ? ` ⚠️ ${Math.round(minutes)} min in this tool` : "";
+}
+
+function duration(milliseconds: number): string {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
 }
 
 function escapeHtml(text: string): string {
