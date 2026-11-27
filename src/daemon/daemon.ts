@@ -14,7 +14,7 @@ import { findSessionFile, isDirectory, matchDirectory, readSessionHeader, recent
 import { attachmentsOf, composePrompt, saveAttachments } from "./files.ts";
 import { SessionHub, type LiveSession } from "./hub.ts";
 import { readFirstPrompt } from "./session-prompt.ts";
-import type { TgButton, TgCallbackQuery, TgChat, TgMessage, TgUpdate } from "./types.ts";
+import type { TgButton, TgCallbackQuery, TgChat, TgMessage, TgMessageReaction, TgUpdate } from "./types.ts";
 
 /** Telegram sends each item of an album as its own message, close together. */
 const ALBUM_WAIT_MS = 1_500;
@@ -68,6 +68,8 @@ export class Daemon {
   private readonly albums = new Map<string, { messages: TgMessage[]; timer: NodeJS.Timeout }>();
   /** /ls entries, whose text shows the session's state. */
   private readonly entries = new Set<number>();
+  /** /dashboard snapshots: a reaction to one of these refreshes it in place. */
+  private readonly dashboards = new Set<number>();
   /** When an update from each stranger was last logged. */
   private readonly ignored = new Map<string, number>();
   private readonly halt = new AbortController();
@@ -132,7 +134,7 @@ export class Daemon {
         const updates = await this.api<TgUpdate[]>("getUpdates", {
           offset: this.offset,
           timeout: 50,
-          allowed_updates: ["message", "callback_query"],
+          allowed_updates: ["message", "callback_query", "message_reaction"],
         }, 70_000);
         delay = 0;
         for (const update of updates) {
@@ -160,7 +162,7 @@ export class Daemon {
    * and only the owner's reach Pi. Others get no answer at all.
    */
   private accept(update: TgUpdate): void {
-    const { message, callback_query: query } = update;
+    const { message, callback_query: query, message_reaction: reaction } = update;
     if (message) {
       if (!this.sentByOwner(message)) {
         this.ignore("message", message.from?.id, message.chat?.id);
@@ -174,7 +176,20 @@ export class Daemon {
         return;
       }
       this.enqueue(() => this.onCallback(query));
+    } else if (reaction) {
+      if (!this.reactedByOwner(reaction)) {
+        this.ignore("reaction", reaction.user?.id, reaction.chat?.id);
+        return;
+      }
+      this.enqueue(() => this.onReaction(reaction));
     }
+  }
+
+  /** A reaction of the owner in the owner's private chat with the bot. */
+  private reactedByOwner(reaction: TgMessageReaction): boolean {
+    return this.ownersChat(reaction.chat)
+      && String(reaction.user?.id) === this.options.remote.userId
+      && !reaction.user?.is_bot;
   }
 
   /** Sent by the owner, in the owner's private chat with the bot. */
@@ -287,7 +302,7 @@ export class Daemon {
       "A command sent as a reply, such as /model or /notify on, runs in that session as if typed on the computer.",
       "",
       "/ls – running sessions, with buttons for the last answer, stopping, and notifications",
-      "/dashboard – what each session is doing right now, where it is stuck, and for how long (alias /d)",
+      "/dashboard – what each session is doing right now, where it is stuck, and for how long (alias /d). React to one of its messages with any emoji to refresh it.",
       "/model – choose the session's model with buttons",
       "/new [directory] [prompt] – start a session. The directory can be the start of a project's name. As a reply, it starts in that session's directory.",
       "/stop – stop the session you reply to, or the only one working",
@@ -329,7 +344,13 @@ export class Daemon {
     await this.readFirstPrompts(sessions);
     for (const live of sessions) {
       const activity = await this.activityOf(live);
-      await this.say(undefined, describeActivity(live, activity), { html: true, keyboard: dashboardKeyboard(live), session: live });
+      const sent = await this.say(undefined, describeActivity(live, activity), { html: true, keyboard: dashboardKeyboard(live), session: live });
+      if (sent === undefined) continue;
+      this.dashboards.add(sent);
+      for (const old of this.dashboards) {
+        if (this.dashboards.size <= 200) break;
+        this.dashboards.delete(old);
+      }
     }
   }
 
@@ -665,6 +686,26 @@ export class Daemon {
     if (where === undefined || !result.ok) return;
     if (this.entries.has(where)) await this.edit(where, describe(live), { html: true, keyboard: sessionKeyboard(live) });
     else if (action === "x") await this.edit(where, `Stopping ${label(live)}.`);
+  }
+
+  /**
+   * Any reaction to a /dashboard snapshot refreshes it: a tap is one update, so the
+   * entry is rewritten in place with the fresh state. The reaction stays, and the
+   * bot leaves the message otherwise untouched, so this costs no chat message.
+   */
+  private async onReaction(reaction: TgMessageReaction): Promise<void> {
+    // Removing a reaction is not a request; adding or replacing one is.
+    if (!reaction.new_reaction?.length) return;
+    if (!this.dashboards.has(reaction.message_id)) return;
+    const link = await this.links.lookup(reaction.message_id);
+    const live = link ? this.hub.find(link.session) : undefined;
+    if (!live) {
+      await this.edit(reaction.message_id, "💤 That session is not running.");
+      this.dashboards.delete(reaction.message_id);
+      return;
+    }
+    const activity = await this.activityOf(live);
+    await this.edit(reaction.message_id, describeActivity(live, activity), { html: true, keyboard: dashboardKeyboard(live) });
   }
 
   /** Ask the session for a status summary; the reply arrives as its own Telegram message. */
