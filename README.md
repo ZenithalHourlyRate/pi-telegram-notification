@@ -41,7 +41,7 @@ One notification is sent when the complete agent run settles, after automatic re
 
 `/notify last` reads the last assistant response on the current branch of the session, so it also works after `/reload`, `/resume`, or `/tree`. It sends the same message a notification would, with the status taken from how that response ended. While Pi is working, it reports an error; use `/notify on` to be notified when the run stops.
 
-The message contains the status, session name or ID, working directory, and the final assistant text or error, limited to Telegram's message size. Thinking and tool output are omitted.
+The message contains the status, session name or ID, working directory, and the assistant text or error, limited to Telegram's message size. Thinking and tool output are omitted. One notification covers one prompt: when a prompt's run is continued by queued messages, such as a finished background task (`pi-background-tasks`), the answer and those later replies arrive together, in the order they were said, instead of the follow-up replacing the answer.
 
 Messages are sent as Telegram [rich messages](https://core.telegram.org/bots/api#rich-messages) (Bot API 10.1), which Telegram renders from the assistant's Markdown: headings, lists, task lists, tables, code blocks, quotes, footnotes, formulas, and images. Older Telegram apps may not display rich messages correctly. Replies are limited to about 32,000 characters and cut at a paragraph or other block boundary.
 

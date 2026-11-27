@@ -64,6 +64,29 @@ function sessionTerminal(): SessionTerminal | undefined {
   return backend && pane ? { backend, pane } : undefined;
 }
 
+/** The text an assistant message said, without its reasoning or tool calls. */
+function saidText(message: AssistantMessage): string {
+  return message.content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+}
+
+/**
+ * Everything the assistant said for one prompt, in the order it said it. A prompt can be followed
+ * by queued messages, such as a finished background task, that keep the run alive long enough for
+ * Pi to settle once: the answer and those later replies then belong to the same notification.
+ */
+function burstText(burst: AssistantMessage[]): string | undefined {
+  const said: string[] = [];
+  for (const message of burst) {
+    const text = saidText(message);
+    if (text && text !== said.at(-1)) said.push(text);
+  }
+  return said.length ? said.join("\n\n") : undefined;
+}
+
 interface NotificationReceipt {
   sent: boolean;
   message: string;
@@ -76,6 +99,12 @@ export default function (pi: ExtensionAPI) {
   const setFooterEnabled = installNotificationFooter();
   let enabled = false;
   let lastAssistant: AssistantMessage | undefined;
+  /**
+   * The assistant replies a single prompt produced, in order: the answer, then whatever the
+   * queued follow-ups added. Pi settles only after those, so the answer has to be kept or the
+   * notification reports the follow-up instead of it.
+   */
+  let replies: AssistantMessage[] = [];
   let outcome: AgentActivityOutcome | undefined;
 
   // Remote control through the daemon (daemon.ts).
@@ -164,13 +193,11 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     status: string,
     response: AssistantMessage | undefined,
+    burst: AssistantMessage[] = [],
   ): NotificationContent {
     const detail = status === "error"
       ? response?.errorMessage || "The agent stopped with an error."
-      : response?.content
-          .filter((part) => part.type === "text")
-          .map((part) => part.text)
-          .join("\n");
+      : burstText(burst) ?? (response ? saidText(response) || undefined : undefined);
     const name = ctx.sessionManager.getSessionName() || ctx.sessionManager.getSessionId().slice(0, 8);
     return {
       status,
@@ -670,6 +697,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     enabled = false;
     lastAssistant = undefined;
+    replies = [];
     outcome = undefined;
     away = false;
     replyTo = undefined;
@@ -697,11 +725,16 @@ export default function (pi: ExtensionAPI) {
     remote?.send({ type: "update", session: sessionInfo(ctx) });
   });
 
-  // A prompt typed on the computer replaces one from Telegram that has not started.
-  pi.on("input", (event) => {
-    if (event.source === "interactive") clearExpected({ ok: false, message: "A prompt typed on the computer came first." });
+  // A prompt typed on the computer replaces one from Telegram that has not started, and starts a
+  // new notification: its answer is not the answer the previous prompt is still waiting for.
+  pi.on("input", (event, ctx) => {
+    if (event.source !== "interactive") return;
+    clearExpected({ ok: false, message: "A prompt typed on the computer came first." });
+    if (ctx.isIdle()) replies = [];
   });
 
+  // Queued messages (a finished background task, for one) continue the run, so a new run does not
+  // begin a new answer: keep what the prompt already said.
   pi.on("before_agent_start", () => {
     lastAssistant = undefined;
     outcome = undefined;
@@ -711,6 +744,9 @@ export default function (pi: ExtensionAPI) {
     if (expected) {
       replyTo = expected.replyTo;
       clearExpected({ ok: true });
+      // A prompt from Telegram answers there, and its answer starts with this run.
+      replies = [];
+      lastAssistant = undefined;
     }
     setState("working");
   });
@@ -724,7 +760,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_end", (event) => {
-    if (event.message.role === "assistant") lastAssistant = event.message;
+    if (event.message.role !== "assistant") return;
+    lastAssistant = event.message;
+    if (replies.at(-1) !== event.message) replies.push(event.message);
   });
 
   pi.on("agent_before_settle", (event) => {
@@ -736,12 +774,14 @@ export default function (pi: ExtensionAPI) {
     const target = replyTo;
     replyTo = undefined;
     setState("idle");
+    const burst = replies;
+    replies = [];
     // A run started from Telegram answers there, even with notifications off.
     if (enabled || away || target !== undefined) {
       const status = event.aborted || lastAssistant?.stopReason === "aborted"
         ? "aborted"
         : outcome ?? (lastAssistant?.stopReason === "error" ? "error" : "stopped");
-      await deliver(ctx, notificationContent(ctx, status, lastAssistant), target);
+      await deliver(ctx, notificationContent(ctx, status, lastAssistant, burst), target);
     }
     // Sent from agent_settled, the command runs once every settled handler has finished.
     if (reloadWhenIdle) {

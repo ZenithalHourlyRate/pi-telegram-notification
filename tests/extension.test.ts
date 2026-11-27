@@ -36,6 +36,8 @@ async function waitFor<T>(check: () => T, timeout = 3_000): Promise<NonNullable<
 interface FixtureOptions {
   responses?: Array<"stop" | "error" | "retry">;
   reply?: string;
+  /** One reply per model call, for a prompt whose runs say different things. */
+  replies?: string[];
   waitForAbort?: boolean;
   rejectDelivery?: boolean;
   rejectRich?: boolean;
@@ -151,7 +153,7 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
         model: model.id,
         content: [
           { type: "thinking", thinking: "Do not notify with thinking." },
-          { type: "text", text: options.reply ?? "The task is complete." },
+          { type: "text", text: options.replies?.[calls] ?? options.reply ?? "The task is complete." },
         ],
         stopReason: result === "stop" ? "stop" : "error",
         ...(result === "error" ? { errorMessage: "Permission denied" } : {}),
@@ -314,6 +316,29 @@ test("one delivery and thread receipt after retries and queued follow-ups have f
   assert.equal(f.receipts().length, 1);
   assert.deepEqual(f.receipts()[0].type, "custom");
   assert.equal(f.session.messages.filter((message) => message.role === "custom").length, 0);
+});
+
+test("the notification carries the answer before the reply to a queued follow-up", async (t) => {
+  let ends = 0;
+  const f = await fixture(t, {
+    responses: ["stop", "stop"],
+    replies: ["The task is complete.", "The background task finished."],
+    extension(pi) {
+      pi.on("agent_end", () => {
+        ends++;
+        // A finished background task keeps the run alive the way its notification does.
+        if (ends === 1) pi.sendUserMessage("<background-task-notification/>", { deliverAs: "followUp" });
+      });
+    },
+  });
+  await f.session.prompt("/notify on");
+  await f.session.prompt("Do the task.");
+  assert.equal(f.calls(), 2);
+  assert.equal(f.deliveries.length, 1);
+  const text = f.deliveries[0].text;
+  // Pi settles once, after the follow-up: the answer it replaced must still be in the message.
+  assert.match(text, /The task is complete\./);
+  assert.match(text, /The background task finished\./);
 });
 
 test("/notify last sends the last response without turning notifications on", async (t) => {
