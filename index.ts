@@ -1,7 +1,6 @@
 import { hostname } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { complete } from "@earendil-works/pi-ai/compat";
 import {
   getAgentDir,
   type AgentActivityOutcome,
@@ -243,16 +242,22 @@ export default function (pi: ExtensionAPI) {
     if (!model) {
       throw new Error(`unknown model ${provider ? `${provider}/${id}` : id}; set summaryModel in telegram-notification.json`);
     }
-    const auth = provider ? await ctx.modelRegistry.getProviderAuth(provider).catch(() => undefined) : undefined;
-    const apiKey = auth?.auth.apiKey;
-    const message = await complete(
-      { ...model, ...(apiKey ? { apiKey } : {}) },
-      {
-        systemPrompt: SUMMARY_PROMPT,
-        messages: [{ role: "user", content: [{ type: "text", text: transcriptExcerpt(ctx) }], timestamp: Date.now() }],
-      },
-      { signal: AbortSignal.timeout(SUMMARY_TIMEOUT_MS) },
-    );
+    // The registry resolves the provider's credentials exactly as a session turn does.
+    // complete() from pi-ai/compat cannot: it reads the environment and fails with
+    // "No API key for provider", which is what made every summary empty.
+    const message = await ctx.modelRegistry
+      .streamSimple(
+        model,
+        {
+          systemPrompt: SUMMARY_PROMPT,
+          messages: [{ role: "user", content: [{ type: "text", text: transcriptExcerpt(ctx) }], timestamp: Date.now() }],
+        },
+        { signal: AbortSignal.timeout(SUMMARY_TIMEOUT_MS) },
+      )
+      .result();
+    if (message.stopReason === "error") {
+      throw new Error(message.errorMessage || "the summary model failed");
+    }
     const text = message.content
       .filter((part) => part.type === "text")
       .map((part) => part.text)
